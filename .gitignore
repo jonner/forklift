@@ -80,3 +80,6 @@ operator/streams/**/downstream_manifests
 
 .gemini/
 gha-creds-*.json
+
+# Mock server certificates
+pkg/controller/provider/container/nutanix/testdata/*.pem
