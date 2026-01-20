@@ -1,0 +1,628 @@
+ Implementation Plan: Add Nutanix Provider to Forklift
+
+ Overview
+
+ Add Nutanix AHV as a supported provider for Forklift, enabling VM migration from Nutanix infrastructure to OpenShift KubeVirt. This plan follows a
+ phased approach starting with research/proof-of-concept, with clear paths to full production implementation.
+
+ Target: Prism Central v3 API (primary), with Prism Element support (fallback)
+ Approach: Phased implementation - POC first, then full migration support
+ Pattern: Follow existing vSphere provider implementation as reference
+
+ ---
+ Architecture Decision: Prism Central vs Prism Element
+
+ Primary Target: Prism Central
+ - Centralized multi-cluster management (like vCenter for VMware)
+ - Most enterprise deployments use Prism Central
+ - Unified v3 REST API across all Nutanix clusters
+ - Simpler for users with multiple clusters
+
+ Secondary Support: Prism Element
+ - Direct cluster-level management
+ - Support for single-cluster deployments
+ - Same v3 API structure but cluster-scoped
+ - Configure via provider settings
+
+ Implementation: Use prismType setting to differentiate, defaulting to Prism Central.
+
+ ---
+ Phase 1: Core Provider Infrastructure (POC - Week 1-2)
+
+ Goal
+
+ Establish basic provider registration, authentication, and inventory collection. No migration support yet.
+
+ 1.1 Provider Type Registration
+
+ File: pkg/apis/forklift/v1beta1/provider.go
+
+ Add Nutanix as a provider type:
+ // Line 42: Add to ProviderType constants
+ const (
+     // ... existing types ...
+     Nutanix   ProviderType = "nutanix"
+ )
+
+ // Line 50: Add to ProviderTypes slice
+ var ProviderTypes = []ProviderType{
+     // ... existing types ...
+     Nutanix,
+ }
+
+ // Line 72: Add Nutanix settings constants
+ const (
+     // ... existing settings ...
+     NutanixPrismType   = "prismType"    // "central" or "element"
+     NutanixClusterUUID = "clusterUuid"  // For Prism Element mode
+ )
+
+ 1.2 Data Model Definition
+
+ File: pkg/controller/provider/model/nutanix/model.go (NEW)
+
+ Create core data structures following vSphere pattern:
+ - Base struct (ID, Name, Parent, Revision)
+ - Cluster - Nutanix cluster metadata
+ - Host - AHV hypervisor nodes
+ - Network - Nutanix subnets/VLANs
+ - StorageContainer - Nutanix storage containers
+ - VM - Virtual machine details with NICs, disks, guest tools
+ - Image - Disk images and ISOs
+
+ Pattern Reference: pkg/controller/provider/model/vsphere/model.go:1-150
+
+ Key fields for Nutanix VM:
+ type VM struct {
+     Base
+     Cluster           string
+     UUID              string
+     PowerState        string  // "ON", "OFF"
+     NumSockets        int
+     NumVcpusPerSocket int
+     MemorySizeMB      int64
+     BootConfig        BootConfig  // LEGACY, UEFI, SECURE_BOOT
+     NICs              []NIC
+     Disks             []Disk
+     GuestTools        GuestTools
+     // ... additional fields
+ }
+
+ File: pkg/controller/provider/model/nutanix/doc.go (NEW)
+ func All() []interface{} {
+     return []interface{}{
+         &Cluster{},
+         &Host{},
+         &Network{},
+         &StorageContainer{},
+         &VM{},
+         &Image{},
+     }
+ }
+
+ File: pkg/controller/provider/model/doc.go (MODIFY)
+
+ Add Nutanix case to Models() function:
+ case api.Nutanix:
+     all = append(all, nutanix.All()...)
+
+ 1.3 Nutanix API Client
+
+ File: pkg/controller/provider/container/nutanix/client.go (NEW)
+
+ Implement REST client for Nutanix Prism v3 API:
+
+ Key Dependencies:
+ - Option 1: Use github.com/nutanix-cloud-native/prism-go-client SDK
+ - Option 2: Implement custom REST client (following oVirt pattern)
+
+ Core Methods:
+ type Client struct {
+     url           string              // https://prism:9440
+     client        *libweb.Client      // HTTP client
+     secret        *core.Secret        // Kubernetes secret
+     clientTimeout time.Duration
+     log           logging.LevelLogger
+ }
+
+ func (c *Client) connect() (status int, err error)
+     // Authenticate with Basic Auth or API token
+     // Test endpoint: POST /api/nutanix/v3/clusters/list
+
+ func (c *Client) list(path string, list interface{}) error
+     // POST to /api/nutanix/v3/<resource>/list
+     // Note: Nutanix uses POST for list operations with JSON filter
+
+ func (c *Client) clusters() ([]Cluster, error)
+ func (c *Client) hosts(clusterUUID string) ([]Host, error)
+ func (c *Client) vms(filter map[string]interface{}) ([]VM, error)
+ func (c *Client) networks(clusterUUID string) ([]Network, error)
+ func (c *Client) storageContainers(clusterUUID string) ([]StorageContainer, error)
+
+ Pattern Reference: pkg/controller/provider/container/ovirt/client.go
+
+ Authentication: Support both username/password and API token via Kubernetes Secret:
+ apiVersion: v1
+ kind: Secret
+ metadata:
+   name: nutanix-credentials
+ stringData:
+   user: "admin"
+   password: "password"
+   cacert: |
+     -----BEGIN CERTIFICATE-----
+     ...
+   insecureSkipVerify: "false"
+
+ 1.4 Inventory Collector
+
+ File: pkg/controller/provider/container/nutanix/collector.go (NEW)
+
+ Implement inventory collection following vSphere pattern:
+
+ type Collector struct {
+     provider *api.Provider
+     db       libmodel.DB
+     client   *Client
+     cancel   func()
+     phase    string
+     // ... additional fields
+ }
+
+ func (r *Collector) Test() (status int, err error)
+     // Test connection to Nutanix
+
+ func (r *Collector) Start() error
+     // Start inventory collection cycle
+
+ func (r *Collector) Refresh() error
+     // Periodic inventory refresh
+
+ // Resource collection methods
+ func (r *Collector) clusters() error
+ func (r *Collector) hosts() error
+ func (r *Collector) networks() error
+ func (r *Collector) storageContainers() error
+ func (r *Collector) vms() error
+
+ Pattern Reference: pkg/controller/provider/container/vsphere/collector.go:1-100
+
+ File: pkg/controller/provider/container/nutanix/model.go (NEW)
+
+ Map Nutanix API responses to internal models (transformation layer).
+
+ File: pkg/controller/provider/container/doc.go (MODIFY)
+
+ Register collector in Build() function:
+ case api.Nutanix:
+     return nutanix.New(db, provider, secret)
+
+ ---
+ Phase 2: Web API Handlers (POC - Week 2-3)
+
+ Goal
+
+ Expose Nutanix inventory via REST API for UI consumption.
+
+ 2.1 Base Web Handler Setup
+
+ File: pkg/controller/provider/web/nutanix/base.go (NEW)
+ type Handler struct {
+     base.Handler
+ }
+
+ func (h Handler) Prepare(ctx *gin.Context) (int, error)
+     // Common handler preparation
+
+ File: pkg/controller/provider/web/nutanix/client.go (NEW)
+ type Resolver struct {
+     *api.Provider
+ }
+
+ type Finder struct {
+     base.Client
+ }
+
+ // Implement resource resolution for references
+ func (r *Finder) VM(ref *base.Ref) (interface{}, error)
+ func (r *Finder) Network(ref *base.Ref) (interface{}, error)
+ func (r *Finder) Storage(ref *base.Ref) (interface{}, error)
+
+ Pattern Reference: pkg/controller/provider/web/vsphere/client.go
+
+ 2.2 Resource-Specific Handlers
+
+ File: pkg/controller/provider/web/nutanix/provider.go (NEW)
+ - Provider info and list endpoint
+
+ File: pkg/controller/provider/web/nutanix/cluster.go (NEW)
+ - Cluster listing and details
+
+ File: pkg/controller/provider/web/nutanix/host.go (NEW)
+ - Host listing and details
+
+ File: pkg/controller/provider/web/nutanix/network.go (NEW)
+ - Network/subnet listing and details
+
+ File: pkg/controller/provider/web/nutanix/storage.go (NEW)
+ - Storage container listing and details
+
+ File: pkg/controller/provider/web/nutanix/vm.go (NEW)
+ - VM listing, details, and watch support
+ - Implement three detail levels (VM0, VM1, VM)
+
+ Pattern Reference: pkg/controller/provider/web/vsphere/vm.go:1-100
+
+ Key implementation:
+ type VMHandler struct {
+     Handler
+ }
+
+ func (h *VMHandler) AddRoutes(e *gin.Engine)
+ func (h VMHandler) List(ctx *gin.Context)
+ func (h VMHandler) Get(ctx *gin.Context)
+ func (h *VMHandler) watch(ctx *gin.Context)
+
+ 2.3 Web Handler Registration
+
+ File: pkg/controller/provider/web/nutanix/doc.go (NEW)
+ func Handlers(container *container.Container) []libweb.RequestHandler {
+     return []libweb.RequestHandler{
+         &ProviderHandler{},
+         &ClusterHandler{},
+         &HostHandler{},
+         &NetworkHandler{},
+         &StorageHandler{},
+         &VMHandler{},
+         &WorkloadHandler{},
+     }
+ }
+
+ File: pkg/controller/provider/web/doc.go (MODIFY)
+
+ Add to All() function:
+ import nutanixweb "github.com/kubev2v/forklift/pkg/controller/provider/web/nutanix"
+
+ all = append(all, nutanixweb.Handlers(container)...)
+
+ File: pkg/controller/provider/web/provider.go (MODIFY)
+
+ Add Nutanix to provider list handler (around line 100+):
+ // Nutanix
+ nutanixHandler := &nutanixweb.ProviderHandler{
+     Handler: base.Handler{Container: h.Container},
+ }
+ nutanixList, err := nutanixHandler.ListContent(ctx)
+ // ...
+
+ r := Provider{
+     // ... existing providers ...
+     string(api.Nutanix): nutanixList,
+ }
+
+ ---
+ Phase 3: Validation and Testing (POC - Week 3-4)
+
+ 3.1 Provider Validation
+
+ File: pkg/controller/provider/validation.go (MODIFY)
+
+ Add Nutanix-specific validation:
+ - URL format: https://<prism-host>:9440 (port 9440 default)
+ - Required secret fields: user, password
+ - Optional: cacert, insecureSkipVerify
+ - Settings validation: prismType must be "central" or "element"
+ - Connection test: POST to /api/nutanix/v3/clusters/list
+
+ 3.2 Unit Tests
+
+ Create test files:
+ - pkg/controller/provider/container/nutanix/client_test.go
+ - pkg/controller/provider/container/nutanix/collector_test.go
+ - pkg/controller/provider/container/nutanix/model_test.go
+ - pkg/controller/provider/web/nutanix/vm_test.go
+
+ Create mock API responses:
+ - pkg/controller/provider/container/nutanix/testdata/clusters_response.json
+ - pkg/controller/provider/container/nutanix/testdata/vms_response.json
+ - pkg/controller/provider/container/nutanix/testdata/networks_response.json
+
+ 3.3 Integration Testing
+
+ Test Environment Setup:
+
+ Option 1: Nutanix Community Edition (CE)
+ - Download from Nutanix portal (requires registration)
+ - Run in nested virtualization (KVM, ESXi, or Hyper-V)
+ - Minimum: 32GB RAM, 200GB disk
+ - Single-node cluster for testing
+
+ Option 2: Nutanix Test Drive
+ - Free online lab environment
+ - Limited time access (8 hours)
+ - Good for initial API exploration
+
+ Integration Test Checklist:
+ - Provider CR creation and validation
+ - Authentication with Prism Central
+ - Inventory collection completes successfully
+ - Clusters appear in database
+ - VMs listed via REST API
+ - Networks and storage containers visible
+ - Inventory refresh works
+ - Watch functionality for VMs
+
+ ---
+ Phase 4: Migration Support (Future - Week 5+)
+
+ Goal
+
+ Enable actual VM migration from Nutanix AHV to OpenShift KubeVirt.
+
+ Note: This phase is beyond the POC scope but outlined for completeness.
+
+ 4.1 VM Adapter
+
+ File: pkg/controller/plan/adapter/nutanix/adapter.go (NEW)
+
+ Map Nutanix VM specification to KubeVirt VirtualMachine:
+ - CPU topology (sockets × cores)
+ - Memory size
+ - Firmware (BIOS/UEFI/Secure Boot)
+ - Boot device order
+ - Machine type (pc/q35)
+
+ 4.2 Network Mapping
+
+ File: pkg/controller/plan/adapter/nutanix/network.go (NEW)
+
+ Map Nutanix subnets to NetworkAttachmentDefinitions:
+ - VLAN configuration via Multus CNI
+ - IP address preservation (DHCP vs static)
+ - Multiple NIC support
+
+ 4.3 Storage Mapping
+
+ File: pkg/controller/plan/adapter/nutanix/storage.go (NEW)
+
+ Map Nutanix storage containers to KubeVirt storage:
+ - Storage container → StorageClass mapping
+ - PVC creation for each disk
+ - Disk format handling (QCOW2 is native)
+
+ 4.4 Disk Transfer Implementation
+
+ File: pkg/controller/plan/adapter/nutanix/transfer.go (NEW)
+
+ Challenge: Nutanix doesn't have a native export API like VMware VDDK.
+
+ Possible Approaches:
+ 1. Nutanix Image Service API: Export VM disks as images
+ 2. SSH to CVM: Access QCOW2 files directly from Controller VM
+ 3. Volume Snapshot + Backup: Snapshot → S3-compatible → CDI import
+
+ Recommendation: Start with Image Service API, fallback to CVM SSH.
+
+ 4.5 Validation Policy
+
+ File: pkg/controller/validation/policy/nutanix.go (NEW)
+
+ Create validation rules for Nutanix VMs:
+ - Unsupported features (GPU passthrough, vGPU)
+ - Host affinity (convert to nodeSelector)
+ - Volume groups (flatten to individual disks)
+ - Nutanix-specific warnings
+
+ 4.6 Migration Scheduler
+
+ File: pkg/controller/plan/scheduler/nutanix/scheduler.go (NEW)
+
+ Implement migration scheduling logic:
+ - VM dependency ordering
+ - Resource availability checks
+ - Snapshot creation if needed
+ - Progress tracking
+
+ ---
+ Key Technical Considerations
+
+ Nutanix API Details
+
+ Endpoint: https://<prism-central>:9440/api/nutanix/v3/
+
+ Authentication: Basic Auth (username:password) or Bearer token
+
+ List Operations: Use POST with filter body (not GET):
+ POST /api/nutanix/v3/vms/list
+ {
+   "kind": "vm",
+   "offset": 0,
+   "length": 100,
+   "filter": "power_state==ON"
+ }
+
+ Pagination: Use offset and length for large result sets
+
+ Nutanix to KubeVirt Migration Advantages
+
+ 1. No VM conversion needed: Both use KVM (QCOW2 format)
+ 2. Direct disk transfer: Simpler than VMware VMDK conversion
+ 3. Similar virtualization: AHV is KVM-based like KubeVirt
+ 4. Guest tools: Nutanix Guest Tools → qemu-guest-agent transition
+
+ Challenges to Address
+
+ 1. Disk Export Mechanism: No native export API like VDDK
+ 2. Volume Groups: Nutanix-specific feature needs flattening
+ 3. Categories: Nutanix tags → Kubernetes labels/annotations
+ 4. Protection Domains: Handle replicated VMs appropriately
+
+ ---
+ Testing Strategy
+
+ POC Testing (Phases 1-3)
+
+ Without Nutanix Environment:
+ - Unit tests with mock API responses
+ - Integration tests with test data
+ - Manual testing with curl commands
+
+ With Nutanix CE:
+ - End-to-end provider registration
+ - Full inventory collection
+ - REST API endpoint validation
+ - Watch functionality testing
+
+ Migration Testing (Phase 4)
+
+ Prerequisites:
+ - Nutanix cluster with test VMs
+ - OpenShift cluster with KubeVirt
+ - Network connectivity between environments
+ - Appropriate storage classes configured
+
+ Test Scenarios:
+ - Linux VM migration (RHEL, Ubuntu)
+ - Windows VM migration
+ - Multi-disk VMs
+ - VMs with multiple NICs
+ - Various boot modes (BIOS, UEFI)
+
+ ---
+ Dependencies and Prerequisites
+
+ Go Module Dependencies
+
+ Add to go.mod:
+ require (
+     github.com/nutanix-cloud-native/prism-go-client v0.3.2
+     // OR implement custom REST client
+ )
+
+ Nutanix Requirements
+
+ For POC (Phases 1-3):
+ - Nutanix Prism Central or Element (v3 API support)
+ - Admin credentials or read-only RBAC role
+ - Network access from Forklift controller (HTTPS port 9440)
+
+ For Migration (Phase 4):
+ - Snapshot management permissions
+ - Image service access
+ - SSH access to CVM (if using direct export method)
+
+ OpenShift Requirements
+
+ For POC: None (just inventory/API)
+
+ For Migration:
+ - KubeVirt operator installed
+ - CDI (Containerized Data Importer)
+ - Multus CNI for network mapping
+ - Appropriate storage classes for PVCs
+
+ ---
+ File Summary
+
+ New Files to Create
+
+ Models:
+ - pkg/controller/provider/model/nutanix/model.go - Data structures
+ - pkg/controller/provider/model/nutanix/doc.go - Model registration
+
+ Container (Backend):
+ - pkg/controller/provider/container/nutanix/client.go - API client
+ - pkg/controller/provider/container/nutanix/collector.go - Inventory collector
+ - pkg/controller/provider/container/nutanix/model.go - API mapping
+ - pkg/controller/provider/container/nutanix/doc.go - Package docs
+
+ Web (REST API):
+ - pkg/controller/provider/web/nutanix/base.go - Base handler
+ - pkg/controller/provider/web/nutanix/client.go - Finder/Resolver
+ - pkg/controller/provider/web/nutanix/provider.go - Provider handler
+ - pkg/controller/provider/web/nutanix/cluster.go - Cluster handler
+ - pkg/controller/provider/web/nutanix/host.go - Host handler
+ - pkg/controller/provider/web/nutanix/network.go - Network handler
+ - pkg/controller/provider/web/nutanix/storage.go - Storage handler
+ - pkg/controller/provider/web/nutanix/vm.go - VM handler
+ - pkg/controller/provider/web/nutanix/doc.go - Handlers registration
+
+ Tests:
+ - pkg/controller/provider/container/nutanix/*_test.go
+ - pkg/controller/provider/container/nutanix/testdata/*.json
+
+ Files to Modify
+
+ API:
+ - pkg/apis/forklift/v1beta1/provider.go - Add Nutanix provider type
+
+ Registration:
+ - pkg/controller/provider/model/doc.go - Register Nutanix models
+ - pkg/controller/provider/container/doc.go - Register Nutanix collector
+ - pkg/controller/provider/web/doc.go - Register Nutanix handlers
+ - pkg/controller/provider/web/provider.go - Add Nutanix to provider list
+
+ Validation:
+ - pkg/controller/provider/validation.go - Add Nutanix validation rules
+
+ ---
+ Success Criteria
+
+ POC Success (Phases 1-3)
+
+ - Nutanix provider type registered in forklift
+ - Can create Nutanix Provider CR successfully
+ - Authentication with Prism Central works
+ - Inventory collection completes (clusters, hosts, VMs, networks, storage)
+ - REST API endpoints return Nutanix resources
+ - Watch functionality works for VMs
+ - UI can display Nutanix providers and inventory
+
+ Migration Success (Phase 4)
+
+ - Can create migration plan with Nutanix as source
+ - Network mapping UI works
+ - Storage mapping UI works
+ - Can migrate a simple Linux VM successfully
+ - Migrated VM boots in KubeVirt
+ - Migrated VM retains network configuration
+ - Migrated VM retains all disks
+
+ ---
+ Next Steps
+
+ Immediate (For POC)
+
+ 1. Set up Nutanix CE test environment or use Test Drive
+ 2. Test Nutanix v3 API with curl/Postman to understand responses
+ 3. Begin Phase 1 implementation (provider type and models)
+ 4. Create mock test data from real Nutanix API responses
+
+ Future (For Production)
+
+ 1. Complete migration adapter implementation
+ 2. Extensive testing with various VM configurations
+ 3. Performance optimization for large-scale migrations
+ 4. Documentation and user guides
+ 5. Console plugin UI updates (if needed)
+ 6. Contribute to upstream forklift project
+
+ ---
+ Resources and References
+
+ Nutanix API Documentation:
+ - Prism Central API: https://www.nutanix.dev/api-reference/prism-central/
+ - API Explorer: https://<prism-central>:9440/api/nutanix/v3/api_explorer/
+
+ Forklift Documentation:
+ - Provider Development: https://github.com/kubev2v/forklift
+ - Existing Providers: Study vSphere, oVirt, OpenStack implementations
+
+ Testing:
+ - Nutanix Community Edition: https://www.nutanix.com/products/community-edition
+ - Nutanix Test Drive: https://www.nutanix.com/test-drive
+
+ Related Projects:
+ - KubeVirt: https://kubevirt.io/
+ - CDI (Containerized Data Importer): https://github.com/kubevirt/containerized-data-importer
+
