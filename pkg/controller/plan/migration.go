@@ -1284,6 +1284,12 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 						return
 					}
 				}
+				// Staggered creates (e.g. Nutanix) may leave some DVs for a
+				// later reconcile. Stay in this phase quietly until all exist;
+				// do not NextPhase with a partial set.
+				if !r.kubevirt.allDataVolumesExist(vm, dataVolumes) {
+					return
+				}
 			}
 
 			// Wait for the DataVolume to adopt the PVC before proceeding
@@ -2341,6 +2347,11 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 				}
 				r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer)
 				if restartLimitExceeded(importer) {
+					// 429/503: keep waiting - CDI CrashLoopBackOff already
+					// spaces retries, and Prism soft limits are transient.
+					if isImportRateLimitFailure(importer) {
+						continue
+					}
 					task.MarkedCompleted()
 					msg, _ := terminationMessage(importer)
 					task.AddError(msg)
@@ -2783,6 +2794,20 @@ func isImportAuthFailure(pod *core.Pod) bool {
 	return strings.Contains(msg, "got 401") ||
 		strings.Contains(msg, "401 Unauthorized") ||
 		strings.Contains(msg, "status code 401")
+}
+
+// isImportRateLimitFailure reports whether the importer failed with HTTP
+// 429/503 (CDI surfaces these as "got 429" / "got 503" in the termination
+// message).
+func isImportRateLimitFailure(pod *core.Pod) bool {
+	msg, ok := importFailureMessage(pod)
+	if !ok {
+		return false
+	}
+	return strings.Contains(msg, "got 429") ||
+		strings.Contains(msg, "got 503") ||
+		strings.Contains(msg, "429 Too Many Requests") ||
+		strings.Contains(msg, "503 Service Unavailable")
 }
 
 func importFailureMessage(pod *core.Pod) (msg string, ok bool) {

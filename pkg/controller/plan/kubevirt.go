@@ -2178,13 +2178,34 @@ func (r *KubeVirt) EnsureDataVolumes(vm *plan.VMStatus, dataVolumes []cdi.DataVo
 		return
 	}
 
+	inFlight := 0
+	for i := range dataVolumeList.Items {
+		switch dataVolumeList.Items[i].Status.Phase {
+		case cdi.ImportScheduled, cdi.ImportInProgress:
+			inFlight++
+		}
+	}
+	maxInFlight := 0
+	if r.Source.Provider.Type() == api.Nutanix {
+		maxInFlight = 1
+	}
+
 	for _, dv := range dataVolumes {
 		if !r.isDataVolumeExistsInList(&dv, dataVolumeList) {
+			if maxInFlight > 0 && inFlight >= maxInFlight {
+				r.Log.Info("Deferring DataVolume create (import concurrency limit).",
+					"dv", path.Join(dv.Namespace, dv.Name),
+					"inFlight", inFlight,
+					"limit", maxInFlight,
+					"vm", vm.String())
+				return nil
+			}
 			err = r.Destination.Create(context.TODO(), &dv)
 			if err != nil {
 				err = liberr.Wrap(err)
 				return
 			}
+			inFlight++
 			r.Log.Info("Created DataVolume.",
 				"dv",
 				path.Join(
@@ -2205,6 +2226,29 @@ func (r *KubeVirt) EnsureDataVolumes(vm *plan.VMStatus, dataVolumes []cdi.DataVo
 		}
 	}
 	return
+}
+
+// allDataVolumesExist reports whether every planned DataVolume is already
+// on the destination (by disk identity). Used so CreateDataVolumes can wait
+// for staggered creates without returning an error.
+func (r *KubeVirt) allDataVolumesExist(vm *plan.VMStatus, planned []cdi.DataVolume) bool {
+	dataVolumeList := &cdi.DataVolumeList{}
+	err := r.Destination.List(
+		context.TODO(),
+		dataVolumeList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(r.vmLabels(vm.Ref)),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		})
+	if err != nil {
+		return false
+	}
+	for i := range planned {
+		if !r.isDataVolumeExistsInList(&planned[i], dataVolumeList) {
+			return false
+		}
+	}
+	return true
 }
 
 // NetAppShiftPVCs builds PVCs for disks mapped to NetApp Shift StorageClasses.

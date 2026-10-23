@@ -547,6 +547,48 @@ func TestIsImportAuthFailure(t *testing.T) {
 	g.Expect(isImportAuthFailure(&core.Pod{})).To(gomega.BeFalse())
 }
 
+func TestIsImportRateLimitFailure(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+
+	terminatedPod := func(message string, exitCode int32) *core.Pod {
+		return &core.Pod{
+			Status: core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{{
+					State: core.ContainerState{
+						Terminated: &core.ContainerStateTerminated{
+							ExitCode: exitCode,
+							Message:  message,
+						},
+					},
+				}},
+			},
+		}
+	}
+	lastTerminatedPod := func(message string, exitCode int32) *core.Pod {
+		return &core.Pod{
+			Status: core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{{
+					LastTerminationState: core.ContainerState{
+						Terminated: &core.ContainerStateTerminated{
+							ExitCode: exitCode,
+							Message:  message,
+						},
+					},
+				}},
+			},
+		}
+	}
+
+	g.Expect(isImportRateLimitFailure(terminatedPod("http: expected status code 200, got 429. Status: 429 Too Many Requests", 1))).To(gomega.BeTrue())
+	g.Expect(isImportRateLimitFailure(terminatedPod("http: expected status code 200, got 503. Status: 503 Service Unavailable", 1))).To(gomega.BeTrue())
+	g.Expect(isImportRateLimitFailure(lastTerminatedPod("got 429 from server", 1))).To(gomega.BeTrue())
+
+	g.Expect(isImportRateLimitFailure(terminatedPod("got 401 Unauthorized", 1))).To(gomega.BeFalse())
+	g.Expect(isImportRateLimitFailure(terminatedPod("connection reset", 1))).To(gomega.BeFalse())
+	g.Expect(isImportRateLimitFailure(terminatedPod("got 429", 0))).To(gomega.BeFalse())
+	g.Expect(isImportRateLimitFailure(&core.Pod{})).To(gomega.BeFalse())
+}
+
 func TestMaybeRefreshImportCredentials(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
