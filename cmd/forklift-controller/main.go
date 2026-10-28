@@ -77,6 +77,10 @@ func main() {
 	// recorder. The client package stays free of a monitoring dependency;
 	// this is the only place the two are joined.
 	nutanixclient.RecordRequest = metrics.RecordNutanixRequest
+	// Optional (NUTANIX_API_SUMMARY): periodic human-readable request/429
+	// summary to the controller log, so a single migration can be profiled
+	// from `kubectl logs` without scraping Prometheus.
+	nutanixclient.StartSummaryLogger()
 
 	// Start prometheus metrics HTTP handler
 	log.Info("setting up prometheus endpoint :2112/metrics")

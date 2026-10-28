@@ -88,6 +88,9 @@ func (rt *meteredRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	if RecordRequest != nil {
 		RecordRequest(rt.subsystem, req.Method, endpoint, code, dur, retryAfter)
 	}
+	if summaryEnabled {
+		recordAPIStat(rt.subsystem, req.Method, endpoint, code, dur, retryAfter)
+	}
 
 	rt.trace(req, endpoint, code, dur, rawRetryAfter, resp)
 
