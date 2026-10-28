@@ -5,8 +5,7 @@
 *.dll
 *.so
 *.dylib
-bin
-forklift-controller
+./bin
 
 # Test binary, build with `go test -c`
 *.test
