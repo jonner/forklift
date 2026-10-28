@@ -612,6 +612,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, configMap *cor
 	}
 
 	client := &Client{Context: r.Context}
+	client.Subsystem = "builder"
 	if err = client.connect(); err != nil {
 		return nil, err
 	}
@@ -872,6 +873,7 @@ func (r *Builder) RefreshImportCredentials(dv *cdi.DataVolume) (bool, error) {
 	}
 
 	client := &Client{Context: r.Context}
+	client.Subsystem = "builder"
 	if err := client.connect(); err != nil {
 		return false, err
 	}

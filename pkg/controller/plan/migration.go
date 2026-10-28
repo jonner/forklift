@@ -29,6 +29,7 @@ import (
 
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
 	liberr "github.com/kubev2v/forklift/pkg/lib/error"
+	metrics "github.com/kubev2v/forklift/pkg/monitoring/metrics/forklift-controller"
 	"github.com/kubev2v/forklift/pkg/settings"
 	"github.com/kubev2v/forklift/pkg/virt-v2v/errorreporting"
 	batchv1 "k8s.io/api/batch/v1"
@@ -1290,6 +1291,12 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				if !r.kubevirt.allDataVolumesExist(vm, dataVolumes) {
 					return
 				}
+
+				// Approximate Prism pull initiations: one CDI importer pod per
+				// DataVolume. Recorded only for Nutanix sources.
+				if r.Context.Source.Provider.Type() == api.Nutanix {
+					metrics.RecordNutanixImporterDataVolumes(len(dataVolumes))
+				}
 			}
 
 			// Wait for the DataVolume to adopt the PVC before proceeding
@@ -2347,6 +2354,9 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 				}
 				r.maybeRefreshImportCredentials(vm, dv.DataVolume, importer)
 				if restartLimitExceeded(importer) {
+					if r.Context.Source.Provider.Type() == api.Nutanix {
+						metrics.RecordNutanixImporterFailure(string(importer.UID), importerFailureCause(importer))
+					}
 					// 429/503: keep waiting - CDI CrashLoopBackOff already
 					// spaces retries, and Prism soft limits are transient.
 					if isImportRateLimitFailure(importer) {
@@ -2778,12 +2788,26 @@ func (r *Migration) maybeRefreshImportCredentials(vm *plan.VMStatus, dv *cdi.Dat
 			"dv.namespace", dv.Namespace)
 		return
 	}
+	metrics.RecordNutanixImportCredentialRefresh()
 	log.Info("Restarted importer after credential refresh.",
 		"pod.name", importer.Name,
 		"pod.namespace", importer.Namespace,
 		"dv.name", dv.Name,
 		"dv.namespace", dv.Namespace,
 		"vm", vm.String())
+}
+
+// importerFailureCause classifies a failed importer pod for metrics:
+// rate_limit (HTTP 429/503) | auth (401) | other.
+func importerFailureCause(pod *core.Pod) string {
+	switch {
+	case isImportRateLimitFailure(pod):
+		return "rate_limit"
+	case isImportAuthFailure(pod):
+		return "auth"
+	default:
+		return "other"
+	}
 }
 
 func isImportAuthFailure(pod *core.Pod) bool {

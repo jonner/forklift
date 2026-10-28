@@ -62,6 +62,10 @@ type Client struct {
 	Timeout time.Duration
 	// Logger. Defaults to a package logger when unset.
 	Log logging.LevelLogger
+	// Subsystem is a bounded metric/trace label identifying which part of
+	// forklift owns this client: collector|adapter|builder. Defaults to
+	// "unknown" when unset.
+	Subsystem string
 
 	mu     sync.Mutex
 	client *libweb.Client
@@ -84,6 +88,9 @@ func (r *Client) Connect() (status int, err error) {
 
 	if r.Log == nil {
 		r.Log = logging.WithName("client|nutanix")
+	}
+	if r.Subsystem == "" {
+		r.Subsystem = "unknown"
 	}
 
 	var tlsClientConfig *tls.Config
@@ -117,19 +124,26 @@ func (r *Client) Connect() (status int, err error) {
 		responseHeaderTimeout = ConnectionTimeout
 	}
 
+	baseTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 10 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       10 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		TLSClientConfig:       tlsClientConfig,
+	}
 	r.client = &libweb.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 10 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       10 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			ResponseHeaderTimeout: responseHeaderTimeout,
-			TLSClientConfig:       tlsClientConfig,
+		// Wrap the transport so every physical request attempt (including
+		// each 429/503 retry) is counted/traced; see metrics.go.
+		Transport: &meteredRoundTripper{
+			next:      baseTransport,
+			subsystem: r.Subsystem,
+			log:       r.Log,
 		},
 	}
 

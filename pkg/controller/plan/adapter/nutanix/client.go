@@ -71,6 +71,11 @@ func (r *Client) connect() error {
 	r.Secret = r.Context.Source.Secret
 	r.Log = r.Context.Log.WithName("client")
 	r.Timeout = r.clientTimeout()
+	// Default the metric subsystem to "adapter"; the builder sets "builder"
+	// on its own clients before calling connect().
+	if r.Subsystem == "" {
+		r.Subsystem = "adapter"
+	}
 	_, err := r.Connect()
 	return err
 }

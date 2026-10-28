@@ -27,7 +27,9 @@ import (
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v6/apis/volumesnapshot/v1"
 	"github.com/kubev2v/forklift/pkg/apis"
 	"github.com/kubev2v/forklift/pkg/controller"
+	nutanixclient "github.com/kubev2v/forklift/pkg/lib/client/nutanix"
 	"github.com/kubev2v/forklift/pkg/lib/logging"
+	metrics "github.com/kubev2v/forklift/pkg/monitoring/metrics/forklift-controller"
 	"github.com/kubev2v/forklift/pkg/settings"
 	"github.com/kubev2v/forklift/pkg/webhook"
 	route "github.com/openshift/api/route/v1"
@@ -70,6 +72,11 @@ func main() {
 	if p := profiler(); p != nil {
 		defer p.Stop()
 	}
+
+	// Wire the Nutanix client's request-recording hook to the Prometheus
+	// recorder. The client package stays free of a monitoring dependency;
+	// this is the only place the two are joined.
+	nutanixclient.RecordRequest = metrics.RecordNutanixRequest
 
 	// Start prometheus metrics HTTP handler
 	log.Info("setting up prometheus endpoint :2112/metrics")

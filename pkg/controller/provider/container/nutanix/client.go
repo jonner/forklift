@@ -71,10 +71,11 @@ type Client struct {
 func (r *Client) ensureWebClient() {
 	if r.web.URL == "" {
 		r.web = nutanixweb.Client{
-			URL:     r.url,
-			Secret:  r.secret,
-			Timeout: r.clientTimeout,
-			Log:     r.log,
+			URL:       r.url,
+			Secret:    r.secret,
+			Timeout:   r.clientTimeout,
+			Log:       r.log,
+			Subsystem: "collector",
 		}
 	}
 }
